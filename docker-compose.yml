@@ -21,6 +21,8 @@ services:
       LEASE_DEFAULT_TTL_MS: "10000"
       # 每个任务键的租约审计 Stream 保留的最新事件条数（0=不限制）
       LEASE_EVENT_RETENTION: "1000"
+      # 全局任务结果变更 Stream（/v1/results/changes）保留的最新变更条数（0=不限制）
+      LEASE_RESULT_CHANGE_RETENTION: "10000"
       LIMIT_KEY_PREFIX: "ratelimit"
       LIMIT_IDEM_KEY_PREFIX: "ratelimit-idem"
       LIMITS_MIN_WINDOW_MS: "1"

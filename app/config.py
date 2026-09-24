@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     event_retention: int = Field(
         default=1_000, ge=0, validation_alias="LEASE_EVENT_RETENTION"
     )
+    # 全局任务结果变更 Stream（所有任务键共用一条）保留的最新变更条数，
+    # 供下游按全局写入顺序订阅已提交结果；超出按最旧变更裁剪。
+    # 0 表示不限制条数（不裁剪）。
+    result_change_retention: int = Field(
+        default=10_000, ge=0, validation_alias="LEASE_RESULT_CHANGE_RETENTION"
+    )
     # 限流键前缀，与租约键前缀隔离，便于多环境共用一个实例
     limit_key_prefix: str = Field(default="ratelimit", validation_alias="LIMIT_KEY_PREFIX")
     # 限流幂等记录键前缀，与限流 ZSet 键隔离

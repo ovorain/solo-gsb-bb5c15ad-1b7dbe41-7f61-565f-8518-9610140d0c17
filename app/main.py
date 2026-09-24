@@ -60,6 +60,8 @@ from .schemas import (
     RenewBatchResponse,
     RenewRequest,
     RenewResponse,
+    ResultChange,
+    ResultChangePage,
     ResultCommitRequest,
     ResultCommitResponse,
     TaskResultResponse,
@@ -97,12 +99,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "供多个工作进程协调独占任务的租约服务、基于 Redis Lua 的"
         "原子滑动窗口成本限流，租约凭据保护的任务结果提交，"
-        "基于持久任务结果的前置依赖门禁，以及前置结果版本快照保护的"
-        "受保护结果提交（FastAPI + Redis Lua）"
+        "基于持久任务结果的前置依赖门禁，前置结果版本快照保护的"
+        "受保护结果提交，以及按全局写入顺序订阅已提交结果的"
+        "结果变更流（FastAPI + Redis Lua）"
     ),
     lifespan=lifespan,
 )
@@ -146,6 +149,12 @@ def result_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:result:{task_key}"
 
 
+def result_changes_key(settings: Settings) -> str:
+    # 所有任务键共用的全局结果变更流（无 TTL，按保留条数裁剪），
+    # 与单任务结果 Hash 共享前缀、独立命名空间
+    return f"{settings.key_prefix}:result-changes"
+
+
 def dependency_key(settings: Settings, task_key: str) -> str:
     # 前置依赖定义（Redis List），与结果 / 租约共享前缀、独立命名空间
     return f"{settings.key_prefix}:deps:{task_key}"
@@ -153,6 +162,12 @@ def dependency_key(settings: Settings, task_key: str) -> str:
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
 _STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
+
+
+def _stream_id_tuple(entry_id: str) -> tuple[int, int]:
+    """把 Redis Stream 条目 ID（"<毫秒>-<序号>"）解析为可比较的元组。"""
+    ms, seq = entry_id.split("-", 1)
+    return int(ms), int(seq)
 
 
 def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
@@ -576,9 +591,10 @@ async def commit_result(
     旧持有者覆盖新结果"。
 
     - 首次提交（该防栅序号）：写入结果，返回 **200**、`committed=true`、
-      `replayed=false` 与首次提交时刻。
+      `replayed=false` 与首次提交时刻；同脚本内原子向全局结果变更流
+      （`GET /v1/results/changes`）追加一条变更。
     - 相同内容重试：返回 **200**、首次结果与 `replayed=true`
-      （响应头 `Result-Replay: true`），不写入、不刷新提交时刻。
+      （响应头 `Result-Replay: true`），不写入、不刷新提交时刻、不追加变更。
       内容按规范化 JSON 比较（忽略对象键顺序与空白差异）。
     - 同一防栅序号提交**不同内容**：返回 **409** `reason=result_conflict`，
       已存结果保持不变。
@@ -593,8 +609,16 @@ async def commit_result(
             lease_key(settings, req.task_key),
             result_key(settings, req.task_key),
             event_stream_key(settings, req.task_key),
+            result_changes_key(settings),
         ],
-        args=[req.token, str(req.fencing_token), canonical, settings.event_retention],
+        args=[
+            req.token,
+            str(req.fencing_token),
+            canonical,
+            settings.event_retention,
+            req.task_key,
+            settings.result_change_retention,
+        ],
     )
     return build_commit_response(req, response, kind, reason, fencing, committed_at)
 
@@ -670,8 +694,10 @@ async def commit_result_checked(
       **409** `reason=stale_dependencies`，**不改结果**；调用方应重新拉取
       快照（必要时重算）后再提交。
     - 全部一致时才进入与普通提交**相同**的防栅与幂等写入：首次写入 200
-      `committed=true`；相同内容重试 200 `replayed=true`（带头
-      `Result-Replay: true`）；同一防栅序号不同内容 409 `result_conflict`。
+      `committed=true`（同脚本内原子向全局结果变更流
+      `GET /v1/results/changes` 追加一条变更）；相同内容重试 200
+      `replayed=true`（带头 `Result-Replay: true`），不追加变更；同一防栅
+      序号不同内容 409 `result_conflict`。
     - **无前置任务使用空快照**（`snapshot=[]`，亦为缺省值）：无依赖定义
       与空定义的任务均直接通过前置核对，行为与普通提交一致。
     """
@@ -683,6 +709,7 @@ async def commit_result_checked(
             lease_key(settings, req.task_key),
             result_key(settings, req.task_key),
             event_stream_key(settings, req.task_key),
+            result_changes_key(settings),
             dependency_key(settings, req.task_key),
         ],
         args=[
@@ -690,6 +717,8 @@ async def commit_result_checked(
             str(req.fencing_token),
             canonical,
             settings.event_retention,
+            req.task_key,
+            settings.result_change_retention,
             f"{settings.key_prefix}:result:",
             str(len(req.snapshot)),
             *snapshot_deps,
@@ -697,6 +726,96 @@ async def commit_result_checked(
         ],
     )
     return build_commit_response(req, response, kind, reason, fencing, committed_at)
+
+
+@app.get(
+    "/v1/results/changes",
+    response_model=ResultChangePage,
+    tags=["results"],
+    summary="按全局写入顺序订阅任务结果变更（游标分页，跨任务键）",
+    responses={
+        status.HTTP_410_GONE: {"description": "游标早于当前保留的最早变更"},
+    },
+)
+async def list_result_changes(
+    redis: RedisDep,
+    settings: SettingsDep,
+    cursor: str | None = Query(
+        default=None,
+        description=(
+            "分页游标：上次响应返回的 next_cursor（Redis Stream 条目 ID）；"
+            "不传表示从当前保留的最早变更开始。"
+        ),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="单页最多返回的变更条数（1～200，默认 50）",
+    ),
+) -> ResultChangePage:
+    """读取全局任务结果变更流（所有任务键共用一条 Redis Stream），按写入全局顺序
+    （Stream 条目 ID 升序）游标分页，供下游顺序处理已提交结果。
+
+    普通提交（`POST /v1/results/commit`）与携带前置快照的提交
+    （`POST /v1/results/commit-checked`）仅在**首次写入新结果版本**时，于结果
+    写入的同一个 Lua 脚本内原子向该流追加一条变更，含 `task_key`、防栅序号
+    （`fencing_token`）、提交时间（`committed_at_ms`）与当次 JSON 结果
+    （`result`）。提交失败与相同内容重放**不追加**，故每条变更恰好对应一次
+    结果版本推进。全局流默认保留最新 `LEASE_RESULT_CHANGE_RETENTION` 条，
+    超出按最旧变更裁剪。
+
+    - 不传 `cursor`：从当前保留的最早变更开始读（流为空时返回空页）。
+    - 传入的 `cursor` **早于当前保留的最早条目**（已被裁剪）时返回 **410**，
+      提示游标失效、避免静默漏读；调用方应从当前最早条目重新追赶
+      （不带 `cursor`）或改走全量对账。
+    """
+    if cursor is not None and not _STREAM_ID_PATTERN.match(cursor):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cursor must be a Redis Stream entry id (<ms>-<seq>)",
+        )
+
+    stream = result_changes_key(settings)
+
+    # 游标可能已落在保留窗口之外：取当前最早条目，游标更早即返回 410，
+    # 避免从 '-' 起读而静默跳过已裁剪部分
+    if cursor is not None:
+        oldest = await redis.xrange(stream, min="-", max="+", count=1)
+        if oldest and _stream_id_tuple(cursor) < _stream_id_tuple(oldest[0][0]):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=(
+                    "cursor is older than the oldest retained change; "
+                    "restart without a cursor to resume from the oldest "
+                    "available change"
+                ),
+            )
+
+    # cursor 语义为"上次最后一条"，用 '(' 排除其本身，避免重复 / 漏读
+    min_id = f"({cursor}" if cursor is not None else "-"
+    raw = await redis.xrange(stream, min=min_id, max="+", count=limit)
+
+    changes = [
+        ResultChange(
+            id=entry_id,
+            task_key=fields["task_key"],
+            fencing_token=int(fields["fencing"]),
+            committed_at_ms=int(fields["committed_at_ms"]),
+            result=json.loads(fields["result"]),
+        )
+        for entry_id, fields in raw
+    ]
+    # 本页恰好满 limit 时补一次探测，判断后面是否还有变更可翻
+    if len(changes) < limit:
+        next_cursor = None
+    else:
+        probe = await redis.xrange(
+            stream, min=f"({changes[-1].id}", max="+", count=1
+        )
+        next_cursor = changes[-1].id if probe else None
+
+    return ResultChangePage(changes=changes, next_cursor=next_cursor)
 
 
 @app.get(

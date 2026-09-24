@@ -52,6 +52,22 @@
   结果提交相同的租约校验，再核对当前前置列表与各结果版本是否与快照一致：
   全部一致才沿用防栅与幂等语义写入；任何不一致返回 stale_dependencies
   （409）且不改结果。
+
+任务结果变更流约定（全局订阅）：
+- 所有任务键共用一条全局 Redis Stream：{prefix}:result-changes。
+  普通结果提交与携带前置快照的受保护提交，在**首次写入新结果版本**（即结果
+  Hash 覆盖写入、返回 committed）的同一个 Lua 脚本内，与结果写入原子地向该
+  全局流 XADD 一条变更，条目 ID 按 Redis 服务器时间生成，故跨任务键严格按
+  写入全局定序，供下游顺序消费。
+- 变更字段：task_key（任务键）、fencing（该结果的防栅序号）、
+  committed_at_ms（提交时间，Redis 服务器毫秒）、result（当次规范化
+  JSON 结果）。
+- 提交失败（凭据类 not_found / conflict / expired、内容冲突
+  result_conflict、前置过期 stale_dependencies）以及相同内容重放
+  （replayed）都**不追加**变更；只有真正写入新结果版本才追加，
+  因此一条变更恰好对应结果 Hash 的一次版本推进。
+- retention > 0 时以 XADD MAXLEN 精确裁剪，全局流只保留最新的 retention 条，
+  超出部分从最旧变更丢弃；retention = 0 表示不限制。
 """
 
 # 租约审计公共函数：拼接到每个需要落账的租约脚本前。
@@ -408,8 +424,10 @@ return {1, expires_at - now}
 #   committed_at_ms 首次提交时刻（Redis 服务器毫秒）
 #
 # KEYS[1] = 租约键, KEYS[2] = 结果键, KEYS[3] = 审计事件流键
+# KEYS[4] = 全局结果变更流键（{prefix}:result-changes，所有任务键共用）
 # ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = 规范化结果 JSON
-# ARGV[4] = 事件保留条数
+# ARGV[4] = 审计事件保留条数, ARGV[5] = 任务键 task_key（写入全局变更流）
+# ARGV[6] = 全局结果变更流保留条数
 # 首次提交 / 新租约覆盖返回 {1, 'committed', fencing, committed_at_ms}
 # 相同内容重放返回   {2, 'replayed', fencing, committed_at_ms}
 # 凭据不符返回       {0, 'conflict', 当前 fencing（无则 0）, 0}
@@ -423,6 +441,8 @@ _RESULT_COMMIT_HEAD_LUA = _AUDIT_LUA + """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local retention = ARGV[4]
+local task_key = ARGV[5]
+local change_retention = ARGV[6]
 
 local token = redis.call('HGET', KEYS[1], 'token')
 if not token then
@@ -476,6 +496,14 @@ redis.call('HSET', KEYS[2],
 audit_add(KEYS[3], retention,
   {'op', 'result_commit', 'result', 'committed',
    'fencing', ARGV[2], 'time_ms', tostring(now)})
+-- 与结果写入同一脚本原子地向全局变更流追加一条：
+-- 记录任务键、防栅序号、提交时间与当次 JSON 结果，跨任务键按写入全局定序。
+-- 仅首次写入新结果版本到达此处：失败与相同内容重放均不追加。
+audit_add(KEYS[4], change_retention,
+  {'task_key', task_key,
+   'fencing', ARGV[2],
+   'committed_at_ms', tostring(now),
+   'result', ARGV[3]})
 return {1, 'committed', tonumber(ARGV[2]), now}
 """
 
@@ -489,23 +517,25 @@ RESULT_COMMIT_LUA = _RESULT_COMMIT_HEAD_LUA + _RESULT_COMMIT_TAIL_LUA
 # 同一头部原样返回，同样不写入结果。
 #
 # KEYS[1] = 租约键, KEYS[2] = 结果键, KEYS[3] = 审计事件流键
-# ARGV[1..4] 与 RESULT_COMMIT_LUA 相同（令牌 / fencing / 规范化结果 JSON / 保留条数）
-# ARGV[5] = 结果键前缀（形如 "<prefix>:result:"）
-# ARGV[6] = 快照前置数 n
-# ARGV[7..n+6]    = 快照前置任务键（快照定义顺序）
-# ARGV[n+7..2n+6] = 快照中各前置结果的 fencing_token（与前一组同序）
+# KEYS[4] = 全局结果变更流键, KEYS[5] = 本任务的依赖定义 List 键
+# ARGV[1..6] 与 RESULT_COMMIT_LUA 相同（令牌 / fencing / 规范化结果 JSON /
+#           审计保留条数 / 任务键 / 全局变更流保留条数）
+# ARGV[7] = 结果键前缀（形如 "<prefix>:result:"）
+# ARGV[8] = 快照前置数 n
+# ARGV[9..n+8]     = 快照前置任务键（快照定义顺序）
+# ARGV[n+9..2n+8]  = 快照中各前置结果的 fencing_token（与前一组同序）
 # 前置不一致返回 {0, 'stale_dependencies', current_fencing, 0}（不写入、只落审计）
 #
-# KEYS[4] = 本任务的依赖定义 List 键（{prefix}:deps:{task_key}，声明为真实键）；
-#           各前置的结果键与环检测脚本一样按前缀在脚本内拼出
+# 本任务的依赖定义 List 键（{prefix}:deps:{task_key}）声明为真实键（KEYS[5]）；
+# 各前置的结果键与环检测脚本一样按前缀在脚本内拼出
 RESULT_COMMIT_CHECKED_LUA = (
     _RESULT_COMMIT_HEAD_LUA
     + """
 -- 前置核对：当前定义必须与快照逐项一致（数量、顺序、键名），
 -- 且每个前置的已提交结果版本（结果 Hash 的 fencing）必须与快照相同。
-local result_prefix = ARGV[5]
-local n = tonumber(ARGV[6])
-local current = redis.call('LRANGE', KEYS[4], 0, -1)
+local result_prefix = ARGV[7]
+local n = tonumber(ARGV[8])
+local current = redis.call('LRANGE', KEYS[5], 0, -1)
 if #current ~= n then
   audit_add(KEYS[3], retention,
     {'op', 'result_commit', 'result', 'stale_dependencies',
@@ -513,16 +543,16 @@ if #current ~= n then
   return {0, 'stale_dependencies', tonumber(current_fencing), 0}
 end
 for i = 1, n do
-  local snap_dep = ARGV[6 + i]
+  local snap_dep = ARGV[8 + i]
   if current[i] ~= snap_dep then
     audit_add(KEYS[3], retention,
       {'op', 'result_commit', 'result', 'stale_dependencies',
        'fencing', ARGV[2], 'time_ms', tostring(now)})
     return {0, 'stale_dependencies', tonumber(current_fencing), 0}
   end
-  -- 快照中该前置的结果版本（ARGV[n+6+i]）；可提交快照中每项恒为真实版本，
+  -- 快照中该前置的结果版本（ARGV[n+8+i]）；可提交快照中每项恒为真实版本，
   -- "0" 仅作为防御性兜底
-  local snap_f = tonumber(ARGV[n + 6 + i])
+  local snap_f = tonumber(ARGV[n + 8 + i])
   local cur_f = tonumber(redis.call('HGET', result_prefix .. snap_dep, 'fencing'))
   if (cur_f or 0) ~= snap_f then
     audit_add(KEYS[3], retention,

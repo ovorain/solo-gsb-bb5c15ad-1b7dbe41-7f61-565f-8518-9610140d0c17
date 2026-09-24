@@ -52,6 +52,16 @@
 租约提交覆盖时返回 `409 stale_dependencies` 且**不改结果**。无前置任务使用空快照
 （`snapshot=[]`）。原 `POST /v1/results/commit` 接口保持不变。
 
+还提供**任务结果变更订阅**：普通提交与携带前置快照的受保护提交，仅在**首次写入
+新结果版本**时，于结果写入的**同一个 Lua 脚本**内原子向**所有任务键共用的一条
+全局 Redis Stream** 追加一条变更，记录 `task_key`、防栅序号、提交时间与当次
+JSON 结果，跨任务键按写入全局定序；**提交失败（凭据无效 / 内容冲突 / 前置过期）
+与相同内容重放都不追加**。下游通过
+`GET /v1/results/changes?cursor=&limit=` 以 Stream 条目 ID 为游标按写入顺序
+分页读取（返回 `next_cursor`）；不传游标从当前保留的最早变更读起，游标早于最早
+保留条目（已被裁剪）时返回 **410**，避免静默漏读。全局流默认保留最新 **10000**
+条，条数可由环境变量配置。
+
 技术栈：Python 3.12 · FastAPI · Redis 7（Lua 脚本保证原子性）
 
 ## 快速开始（一条命令）
@@ -83,6 +93,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | `LEASE_MAX_TTL_MS` | `300000` | 允许的最大 TTL（毫秒） |
 | `LEASE_DEFAULT_TTL_MS` | `10000` | 请求未指定 `ttl_ms` 时的默认值 |
 | `LEASE_EVENT_RETENTION` | `1000` | 每个任务键的租约审计 Stream 保留的最新事件条数；超出按最旧事件裁剪。`0` 表示不限制 |
+| `LEASE_RESULT_CHANGE_RETENTION` | `10000` | 全局任务结果变更 Stream（`/v1/results/changes`，所有任务键共用）保留的最新变更条数；超出按最旧变更裁剪。`0` 表示不限制 |
 | `LIMIT_KEY_PREFIX` | `ratelimit` | 限流 Redis 键前缀，与租约键隔离 |
 | `LIMIT_IDEM_KEY_PREFIX` | `ratelimit-idem` | 限流幂等记录 Redis 键前缀，与限流 ZSet 隔离 |
 | `LIMITS_MIN_WINDOW_MS` | `1` | 允许的最小限流窗口（毫秒） |
@@ -107,6 +118,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
 | POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409 |
 | POST | `/v1/results/commit-checked` | 携带前置版本快照提交结果：同一 Lua 操作内核对租约 + 当前前置列表及各结果版本，全部一致才沿用防栅与幂等语义写入；不一致 409 `stale_dependencies` 且不改结果；无前置用空快照 |
+| GET | `/v1/results/changes` | 按全局写入顺序订阅任务结果变更（跨任务键，`cursor` / `limit`，返回 `next_cursor`）；仅首次写入新结果版本追加；不传游标从最早保留条目读起，游标早于最早保留条目返回 **410** |
 | GET | `/v1/results/{task_key}` | 读取最近一次已提交结果及防栅序号（持久保留，不随租约到期删除） |
 | POST | `/v1/dependencies/{task_key}` | 保存前置依赖定义（去重、最多 16 个，空列表清除），Lua 遍历现有定义检测环、单次最多访问 1024 个节点，成环 / 超限 409 且保留原定义；自身依赖 422 |
 | GET | `/v1/dependencies/{task_key}/ready` | 门禁判定：所有直接前置任务均已提交持久结果则 `ready=true`，否则返回未完成键 `pending`；无定义视为可执行 |
@@ -269,6 +281,60 @@ curl -s localhost:8000/v1/results/report:daily
 | `replayed` | 响应 | 同一防栅序号已提交且内容一致时为 `true`，响应头同时带 `Result-Replay: true`；不刷新 `committed_at_ms` |
 | `committed_at_ms` | 响应 | 结果首次提交时刻（Redis 服务器时钟，Unix 毫秒），重放 / 覆盖语义见上 |
 | `reason` | 响应 | 仅 409 时返回：`not_found` / `conflict` / `expired` / `result_conflict` |
+
+### 任务结果变更订阅（全局顺序）
+
+下游需要按**全局顺序**处理所有任务已提交的结果时，轮询
+`GET /v1/results/changes` 即可。普通提交与携带前置快照的受保护提交，仅在
+**首次写入新结果版本**时（结果 Hash 覆盖写入、响应 `committed=true`、
+`replayed=false`），在结果写入的同一个 Lua 脚本内原子向**全局**变更流
+（`{prefix}:result-changes`，所有任务键共用一条）追加一条变更；提交失败
+（`not_found` / `conflict` / `expired` / `result_conflict` /
+`stale_dependencies`）与相同内容重放（`replayed=true`）**都不追加**，因此一条
+变更恰好对应一次结果版本推进，不会因重试产生重复消息。
+
+```bash
+# 首次拉取（不传 cursor）：从当前保留的最早变更开始，默认每页 50 条（limit 1～200）
+curl -s 'localhost:8000/v1/results/changes?limit=20'
+# => {"changes":[
+#   {"id":"1758000000123-0","task_key":"report:daily","fencing_token":1,
+#    "committed_at_ms":1758000000123,"result":{"status":"done","rows":42}},
+#   {"id":"1758000000789-0","task_key":"report:weekly","fencing_token":1,
+#    "committed_at_ms":1758000000789,"result":{"rows":7}}
+# ],"next_cursor":"1758000000789-0"}
+
+# 用上次返回的 next_cursor 继续翻页（游标为闭区间尾部，已自动去重，不重不漏）
+curl -s 'localhost:8000/v1/results/changes?cursor=1758000000789-0&limit=20'
+# 没有更多变更时 next_cursor 为 null
+
+# 游标早于当前保留的最早条目（已被 MAXLEN 裁剪）-> 410 Gone，
+# 不会静默从更新的位置开始而漏掉中间变更；调用方应不带 cursor 从最早可用
+# 条目重新追赶（或改走全量对账）：
+curl -i 'localhost:8000/v1/results/changes?cursor=1700000000000-0'
+# => HTTP/1.1 410 Gone
+# {"detail":"cursor is older than the oldest retained change; ..."}
+
+# 非法 cursor（不是 <数字>-<数字>）-> 400；limit 越界 -> 422
+```
+
+字段与规则说明：
+
+| 字段 / 规则 | 说明 |
+| --- | --- |
+| `id` | Redis Stream 条目 ID（`<毫秒时间>-<序号>`），即分页游标；全局严格升序 |
+| `task_key` | 提交该结果的任务键 |
+| `fencing_token` | 该结果对应的防栅序号（结果版本），与 `GET /v1/results/{task_key}` 同源 |
+| `committed_at_ms` | 结果提交时刻（Redis 服务器时钟，Unix 毫秒） |
+| `result` | 当次提交的 JSON 结果（按规范化 JSON 存储，读回时反序列化为 JSON） |
+| `next_cursor` | 下一页游标（本页最后一条变更 ID）；本页不足 `limit` 或没有更多变更时为 `null` |
+
+- 只追加，不反映结果删除（结果本身无 TTL）；同一任务键被新租约提交新版本时
+  会再追加一条，下游可凭 `(task_key, fencing_token)` 识别版本推进。
+- 全局流以 `XADD MAXLEN n` 在写入同时精确裁剪，只保留最新
+  `LEASE_RESULT_CHANGE_RETENTION` 条（默认 **10000**，`0` 为不限制），超出从最旧
+  变更丢弃；其键与结果 Hash 共享 `LEASE_KEY_PREFIX` 前缀（`:result-changes`）。
+- 该路由注册在按 `task_key` 捕获的 `GET /v1/results/{task_key}` **之前**，
+  因此 `changes` 不会被当作任务键。
 
 ### 任务依赖门禁
 
@@ -634,6 +700,18 @@ curl -i -X POST localhost:8000/v1/limits/check \
   Lua 尾部**（`app/lua.py` 中拼装），凭据、防栅、重放、冲突与审计语义逐字一致，
   仅在两者之间增加前置列表 / 版本核对，失败时多一种
   `stale_dependencies`（409）原因。
+- **全局结果变更流，与结果写入同脚本原子追加**：普通提交与受保护提交仅在首次
+  写入新结果版本（幂等写入尾部的覆盖提交分支）时，于 `HSET` 结果 Hash 的同一
+  Lua 脚本内 `XADD` 一条变更到所有任务键共用的全局 Stream
+  （`{prefix}:result-changes`），字段为 `task_key` / `fencing` /
+  `committed_at_ms` / `result`；条目 ID 由 Redis 服务器时间生成，跨任务键按写入
+  全局定序。失败分支（凭据 / `result_conflict` / `stale_dependencies`）与相同
+  内容重放分支均在到达该 `XADD` 之前返回，**绝不追加**，故每条变更恰好对应一次
+  结果版本推进，重试不会产生重复消息。`XADD MAXLEN n` 同时把全局流裁剪为最新
+  `LEASE_RESULT_CHANGE_RETENTION` 条（默认 10000，`0` 不限制）。读取侧
+  `GET /v1/results/changes` 以 Stream 条目 ID 为游标 `XRANGE` 升序翻页；不传游标
+  从当前最早保留条目起读，游标早于最早保留条目时返回 **410**（不静默漏读），
+  非法游标 400、`limit` 越界 422。
 
 ### 任务依赖门禁设计要点
 
@@ -707,6 +785,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
 | `{prefix}:events:{task_key}` | Stream，条目含 `op` / `result` / `fencing` / `time_ms` / `batch_size`，`XADD MAXLEN` 裁剪 | 租约审计事件，按任务键分组，保留最新 `LEASE_EVENT_RETENTION` 条 |
 | `{prefix}:result:{task_key}` | Hash（`result` / `fencing` / `committed_at_ms`），**无 TTL** | 最近一次已提交任务结果及其防栅序号，不随租约到期删除 |
+| `{prefix}:result-changes` | Stream（所有任务键共用），条目含 `task_key` / `fencing` / `committed_at_ms` / `result`，`XADD MAXLEN` 裁剪 | 全局任务结果变更流：仅首次写入新结果版本时于提交同一 Lua 脚本内原子追加，按写入全局定序，保留最新 `LEASE_RESULT_CHANGE_RETENTION` 条 |
 | `{prefix}:deps:{task_key}` | List（元素为前置任务键，去重、最多 16 个，按请求顺序；键不存在即无定义） | 任务依赖门禁定义；保存前 Lua 沿现有 List 做环检测（去重访问 ≤1024），拒绝保留原定义 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
@@ -733,7 +812,11 @@ conflict / expired）、失败批次不改变任何 TTL、成功 / 失败结果�
 仅有效租约凭据可写入、相同内容重放（`replayed` / `Result-Replay` 头）、
 同序号不同内容 409 `result_conflict` 且不改结果、旧持有者过期 / 被接管后无法
 覆盖、新租约可提交新结果、结果不随租约到期删除、并发相同内容恰好一次提交、
-提交尝试逐次落审计事件；以及限流的剩余额度递减、成本加权、超限 429
+提交尝试逐次落审计事件；以及**全局任务结果变更流**：仅首次写入新结果版本
+（普通提交 / commit-checked）追加变更、失败与相同内容重放不追加、变更含
+task_key / 防栅序号 / 提交时间 / 当次 JSON、跨任务键按写入全局定序、游标分页
+不重不漏、早于最早保留条目的游标 410、非法 cursor 400 / limit 越界 422、
+路由优先于 `{task_key}` 捕获；以及限流的剩余额度递减、成本加权、超限 429
 （含 `Retry-After` 头与不扣减语义）、窗口滑动后恢复、**20 并发恰好放行
 limit 笔不超额**、参数校验和过期数据自动清理；以及 `request_id` 幂等：
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
@@ -765,10 +848,10 @@ uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  config.py    # 环境变量配置（pydantic-settings，含审计流保留条数）
-  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本（普通提交与 commit-checked 共用同一租约校验头 / 幂等写入尾）+ 前置版本快照与受保护提交 Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本 + 依赖保存（现有定义环检测 / 1024 节点上限）Lua 脚本
-  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果模型、任务依赖门禁与前置版本快照模型）
-  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取、依赖保存 / ready / snapshot 门禁、commit-checked 受保护提交）
+  config.py    # 环境变量配置（pydantic-settings，含审计流与全局结果变更流保留条数）
+  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本（普通提交与 commit-checked 共用同一租约校验头 / 幂等写入尾；首次写入新结果版本时同脚本原子追加全局结果变更流）+ 前置版本快照与受保护提交 Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本 + 依赖保存（现有定义环检测 / 1024 节点上限）Lua 脚本
+  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果与全局结果变更分页模型、任务依赖门禁与前置版本快照模型）
+  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取、/v1/results/changes 全局变更游标分页（410 过期游标）、依赖保存 / ready / snapshot 门禁、commit-checked 受保护提交）
 scripts/
   smoke_test.py
 Dockerfile

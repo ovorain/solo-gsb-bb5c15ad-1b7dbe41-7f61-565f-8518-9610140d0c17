@@ -17,6 +17,12 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 仅有效租约凭据可写 / 相同内容重放 / 同序号不同内容 409 且不改结果 /
 旧持有者过期或被接管后无法覆盖 / 新租约可提交新结果 /
 结果不随租约到期删除 / 并发同内容恰好提交一次 / 提交尝试逐次落审计；
+以及全局任务结果变更流：
+仅首次写入新结果版本（普通提交 / commit-checked）追加一条变更 /
+失败（凭据 / result_conflict / stale_dependencies）与相同内容重放不追加 /
+变更含 task_key、防栅序号、提交时间与当次 JSON 结果 / 跨任务键按写入全局
+定序 / cursor + next_cursor 分页不重不漏 / 早于最早保留条目的游标 410 /
+非法 cursor 400、limit 越界 422 / 路由优先于 {task_key} 捕获；
 以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
@@ -176,6 +182,7 @@ def main():
     renew_batch_checks()
     transfer_checks()
     result_checks()
+    result_changes_checks()
     audit_checks()
     limit_checks()
     dependency_checks()
@@ -813,6 +820,193 @@ def result_checks():
           and sum(1 for e in crc if e["result"] == "replayed") == 19
           and all(e["fencing_token"] == ca["fencing_token"] for e in crc),
           f"{[(e['result'], e['fencing_token']) for e in crc]}")
+
+
+def fetch_changes(cursor=None, limit=None):
+    """翻一页全局结果变更，返回 (http_code, body)。"""
+    qs = []
+    if cursor is not None:
+        qs.append(f"cursor={cursor}")
+    if limit is not None:
+        qs.append(f"limit={limit}")
+    suffix = ("?" + "&".join(qs)) if qs else ""
+    return call("GET", f"/v1/results/changes{suffix}")
+
+
+def result_changes_checks():
+    """/v1/results/changes：仅首次写入新结果版本追加 / 失败与重放不追加 /
+    跨任务键全局顺序 / 游标分页 / 410 过期游标 / 参数校验 / 路由优先于
+    {task_key} 捕获路由（GET changes 不被当成任务键 "changes"）。"""
+    base = f"smoke-changes:{int(time.time() * 1000)}"
+    k1, k2, k3 = f"{base}:k1", f"{base}:k2", f"{base}:k3"
+
+    def commit(k, token, fence, result):
+        return call("POST", "/v1/results/commit",
+                    {"task_key": k, "token": token,
+                     "fencing_token": fence, "result": result})
+
+    def commit_checked(k, token, fence, result, snapshot):
+        return call("POST", "/v1/results/commit-checked",
+                    {"task_key": k, "token": token,
+                     "fencing_token": fence, "result": result,
+                     "snapshot": snapshot})
+
+    # 记录测试开始前全局流的最早条目（已存在其他冒烟提交），作为后续基线游标
+    code, first_page = fetch_changes(limit=200)
+    check("changes route resolves (not captured by {task_key})",
+          code == 200 and "changes" in first_page and "next_cursor" in first_page,
+          f"{code} {first_page}")
+    baseline = first_page["changes"][0]["id"] if first_page["changes"] else None
+
+    # 取租约
+    creds = {}
+    for k in (k1, k2, k3):
+        code, a = call("POST", "/v1/leases/acquire",
+                       {"task_key": k, "ttl_ms": 60_000})
+        check("changes setup acquire", code == 200 and a["acquired"], f"{code} {a}")
+        creds[k] = (a["token"], a["fencing_token"])
+
+    # k1 首次提交 -> 一条变更
+    code, c1 = commit(k1, *creds[k1], {"v": 1})
+    check("changes k1 first commit", code == 200 and c1["committed"]
+          and not c1["replayed"], f"{code} {c1}")
+    # 相同内容重放（键序打乱）-> 不追加
+    code, c1r = commit(k1, *creds[k1], {"v": 1})
+    check("changes k1 replay ok", code == 200 and c1r["replayed"], f"{code} {c1r}")
+    # 同序号不同内容 -> 409，不追加
+    code, c1c = commit(k1, *creds[k1], {"v": 2})
+    check("changes k1 conflict -> 409",
+          code == 409 and c1c["reason"] == "result_conflict", f"{code} {c1c}")
+    # 凭据错误 -> 409，不追加
+    code, c1b = commit(k1, "bad-token", creds[k1][1], {"v": 3})
+    check("changes k1 bad creds -> 409",
+          code == 409 and c1b["reason"] == "conflict", f"{code} {c1b}")
+
+    # k2 首次提交 -> 一条变更（排在 k1 变更之后，验证跨任务键全局定序）
+    code, c2 = commit(k2, *creds[k2], {"hello": ["world", 1, True, None]})
+    check("changes k2 first commit", code == 200 and c2["committed"], f"{code} {c2}")
+
+    # k3 经 commit-checked（空快照）首次提交 -> 一条变更；重放 / stale 不追加
+    code, c3 = commit_checked(k3, *creds[k3], {"ok": True}, [])
+    check("changes k3 checked commit", code == 200 and c3["committed"]
+          and not c3["replayed"], f"{code} {c3}")
+    code, c3r = commit_checked(k3, *creds[k3], {"ok": True}, [])
+    check("changes k3 checked replay", code == 200 and c3r["replayed"], f"{code} {c3r}")
+    # stale_dependencies：给 k3 加一个未完成前置后用空快照提交 -> 409，不追加
+    code, _ = call("POST", f"/v1/dependencies/{k3}", {"dependencies": [k1]})
+    code, c3s = commit_checked(k3, *creds[k3], {"ok": True}, [])
+    check("changes k3 stale -> 409",
+          code == 409 and c3s["reason"] == "stale_dependencies", f"{code} {c3s}")
+    # 前置 k1 早已完成：重新拉快照（k1 版本 1）。同 fencing 提交不同内容会
+    # result_conflict，故先重取租约拿到 fencing 2，再提交新内容 -> 追加一条
+    code, snap = call("GET", f"/v1/dependencies/{k3}/snapshot")
+    check("changes k3 snapshot ready",
+          code == 200 and snap["status"] == "snapshot", f"{code} {snap}")
+    code, _ = call("POST", "/v1/leases/release",
+                   {"task_key": k3, "token": creds[k3][0],
+                    "fencing_token": creds[k3][1]})
+    code, a3b = call("POST", "/v1/leases/acquire",
+                     {"task_key": k3, "ttl_ms": 60_000})
+    check("changes k3 re-acquire", code == 200 and a3b["acquired"], f"{code} {a3b}")
+    creds[k3] = (a3b["token"], a3b["fencing_token"])
+    code, c3v2 = commit_checked(k3, *creds[k3], {"ok": "v2"}, snap["dependencies"])
+    check("changes k3 checked new version",
+          code == 200 and c3v2["committed"] and not c3v2["replayed"], f"{code} {c3v2}")
+    call("POST", f"/v1/dependencies/{k3}", {"dependencies": []})
+
+    # 拉取基线之后的全部变更并校验
+    tail = []
+    cursor = baseline
+    while True:
+        code, page = fetch_changes(cursor, 1)
+        check("changes page ok", code == 200, f"{code} {page}")
+        tail.extend(page["changes"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+        if len(tail) > 5000:
+            check("changes pagination terminates", False, "too many pages")
+            break
+
+    # k3 先以 fencing 1 空快照提交、再经重取租约以 fencing 2 + 快照提交新版本
+    k3_f1 = c3["fencing_token"]
+    k3_f2 = c3v2["fencing_token"]
+    assert k3_f2 > k3_f1, (k3_f1, k3_f2)
+    expected = [
+        (k1, creds[k1][1], {"v": 1}, c1["committed_at_ms"]),
+        (k2, creds[k2][1], {"hello": ["world", 1, True, None]}, c2["committed_at_ms"]),
+        (k3, k3_f1, {"ok": True}, c3["committed_at_ms"]),
+        (k3, k3_f2, {"ok": "v2"}, c3v2["committed_at_ms"]),
+    ]
+    mine = [ch for ch in tail if ch["task_key"] in (k1, k2, k3)]
+    check("changes only first-write appended (4 changes)",
+          len(mine) == 4, f"{[(c['task_key'], c['result']) for c in mine]}")
+    check("changes content & order",
+          [(c["task_key"], c["fencing_token"], c["result"], c["committed_at_ms"])
+           for c in mine] == expected, f"{mine}")
+    # 字段形态与 ID 全局升序
+    check("changes fields",
+          all(isinstance(c["id"], str)
+              and tuple(p.isdigit() for p in c["id"].split("-")) == (True, True)
+              and isinstance(c["fencing_token"], int)
+              and isinstance(c["committed_at_ms"], int)
+              for c in mine), f"{mine}")
+    ids = [tuple(int(p) for p in c["id"].split("-")) for c in tail]
+    check("changes globally ascending",
+          all(ids[i] < ids[i + 1] for i in range(len(ids) - 1)), "ids not sorted")
+    # 变更的提交时间 / 结果与 GET /v1/results/{task_key} 同源
+    code, g1 = call("GET", f"/v1/results/{k1}")
+    check("changes matches GET results k1",
+          g1["fencing_token"] == mine[0]["fencing_token"]
+          and g1["result"] == mine[0]["result"]
+          and g1["committed_at_ms"] == mine[0]["committed_at_ms"], f"{g1} {mine[0]}")
+
+    # 分页：limit=2 恰好满页时给 next_cursor；游标为"上次最后一条"，不重不漏
+    code, p1 = fetch_changes(baseline, 2)
+    check("changes page size & cursor",
+          code == 200 and len(p1["changes"]) == 2
+          and p1["next_cursor"] == p1["changes"][-1]["id"], f"{p1}")
+    code, p2 = fetch_changes(p1["next_cursor"], 2)
+    check("changes page 2 no overlap",
+          code == 200 and p2["changes"]
+          and p2["changes"][0]["id"] != p1["changes"][-1]["id"]
+          and _id_tuple(p2["changes"][0]["id"]) > _id_tuple(p1["changes"][-1]["id"]),
+          f"{p1} {p2}")
+
+    # 410：游标早于当前保留的最早条目（流非空，最早条目即基线）
+    oldest = first_page["changes"][0]["id"] if first_page["changes"] else tail[0]["id"]
+    oms, oseq = oldest.split("-")
+    stale_cursor = f"{int(oms) - 1}-0"
+    code, body = fetch_changes(stale_cursor, 10)
+    check("changes stale cursor -> 410",
+          code == 410 and isinstance(body.get("detail"), str), f"{code} {body}")
+
+    # 合法但指向未来的游标 -> 200 空页、next_cursor=null（不算过期）
+    lms, lseq = tail[-1]["id"].split("-")
+    future_cursor = f"{lms}-{int(lseq) + 1000}"
+    code, page = fetch_changes(future_cursor, 10)
+    check("changes future cursor -> empty 200",
+          code == 200 and page["changes"] == []
+          and page["next_cursor"] is None, f"{code} {page}")
+
+    # 不传游标：从当前保留的最早条目开始
+    code, page = fetch_changes(limit=1)
+    check("changes no cursor starts at oldest retained",
+          code == 200 and len(page["changes"]) == 1
+          and page["changes"][0]["id"] == oldest, f"{code} {page}")
+
+    # 参数校验：非法 cursor 400；limit 越界 422
+    code, _ = fetch_changes("not-a-cursor")
+    check("changes bad cursor -> 400", code == 400, f"code={code}")
+    code, _ = fetch_changes(limit=0)
+    check("changes limit 0 -> 422", code == 422, f"code={code}")
+    code, _ = fetch_changes(limit=201)
+    check("changes limit >200 -> 422", code == 422, f"code={code}")
+
+
+def _id_tuple(entry_id):
+    ms, seq = entry_id.split("-", 1)
+    return int(ms), int(seq)
 
 
 def fetch_events(key, cursor=None, limit=None):
