@@ -3,7 +3,8 @@
 所有租约状态转换均由 Redis Lua 脚本原子完成（见 app/lua.py），
 过期判断基于 Redis 服务器时间（TIME 命令）。
 任务结果提交同样由单个 Lua 脚本原子完成租约校验与结果写入，
-避免"校验后租约易主、旧持有者覆盖结果"。
+避免"校验后租约易主、旧持有者覆盖结果"；首次写入新结果版本时
+同一脚本向全局变更 Stream 原子追加一条变更，供下游按写入顺序订阅。
 """
 from __future__ import annotations
 
@@ -62,6 +63,8 @@ from .schemas import (
     RenewResponse,
     ResultCommitRequest,
     ResultCommitResponse,
+    ResultChange,
+    ResultChangePage,
     TaskResultResponse,
     TransferRequest,
     TransferResponse,
@@ -97,12 +100,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "供多个工作进程协调独占任务的租约服务、基于 Redis Lua 的"
         "原子滑动窗口成本限流，租约凭据保护的任务结果提交，"
-        "基于持久任务结果的前置依赖门禁，以及前置结果版本快照保护的"
-        "受保护结果提交（FastAPI + Redis Lua）"
+        "基于持久任务结果的前置依赖门禁，前置结果版本快照保护的"
+        "受保护结果提交，以及按全局写入顺序分页的任务结果变更订阅"
+        "（FastAPI + Redis Lua）"
     ),
     lifespan=lifespan,
 )
@@ -146,6 +150,11 @@ def result_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:result:{task_key}"
 
 
+def result_change_stream_key(settings: Settings) -> str:
+    # 全局结果变更 Stream：所有任务键共享一条，与结果 Hash 共享前缀
+    return f"{settings.key_prefix}:result_changes"
+
+
 def dependency_key(settings: Settings, task_key: str) -> str:
     # 前置依赖定义（Redis List），与结果 / 租约共享前缀、独立命名空间
     return f"{settings.key_prefix}:deps:{task_key}"
@@ -153,6 +162,12 @@ def dependency_key(settings: Settings, task_key: str) -> str:
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
 _STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
+
+
+def _stream_id_tuple(entry_id: str) -> tuple[int, int]:
+    """把 Stream 条目 ID 拆成 (毫秒, 序号) 元组，用于按写入顺序比较大小。"""
+    ms, seq = entry_id.split("-", 1)
+    return int(ms), int(seq)
 
 
 def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
@@ -593,8 +608,16 @@ async def commit_result(
             lease_key(settings, req.task_key),
             result_key(settings, req.task_key),
             event_stream_key(settings, req.task_key),
+            result_change_stream_key(settings),
         ],
-        args=[req.token, str(req.fencing_token), canonical, settings.event_retention],
+        args=[
+            req.token,
+            str(req.fencing_token),
+            canonical,
+            settings.event_retention,
+            req.task_key,
+            settings.result_change_retention,
+        ],
     )
     return build_commit_response(req, response, kind, reason, fencing, committed_at)
 
@@ -683,6 +706,7 @@ async def commit_result_checked(
             lease_key(settings, req.task_key),
             result_key(settings, req.task_key),
             event_stream_key(settings, req.task_key),
+            result_change_stream_key(settings),
             dependency_key(settings, req.task_key),
         ],
         args=[
@@ -690,6 +714,8 @@ async def commit_result_checked(
             str(req.fencing_token),
             canonical,
             settings.event_retention,
+            req.task_key,
+            settings.result_change_retention,
             f"{settings.key_prefix}:result:",
             str(len(req.snapshot)),
             *snapshot_deps,
@@ -697,6 +723,90 @@ async def commit_result_checked(
         ],
     )
     return build_commit_response(req, response, kind, reason, fencing, committed_at)
+
+
+# 注意：本路由必须注册在 /v1/results/{task_key:path} 之前，
+# 否则 "changes" 会被按 task_key 捕获的路由吞掉。
+@app.get(
+    "/v1/results/changes",
+    response_model=ResultChangePage,
+    tags=["results"],
+    summary=(
+        "按全局写入顺序分页订阅任务结果变更（仅首次写入记录；"
+        "游标早于最早保留条目返回 410）"
+    ),
+)
+async def list_result_changes(
+    redis: RedisDep,
+    settings: SettingsDep,
+    cursor: str | None = Query(
+        default=None,
+        description=(
+            "分页游标：上次响应返回的 next_cursor（Redis Stream 条目 ID）；"
+            "不传表示从当前保留的最早变更开始。"
+        ),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="单页最多返回的变更条数（1～200，默认 50）",
+    ),
+) -> ResultChangePage:
+    """读取全局任务结果变更流，按写入顺序（Stream 条目 ID 升序）游标分页。
+
+    普通提交与受保护提交**首次写入新结果版本**（含新租约覆盖旧结果）时，
+    在提交 Lua 脚本内与结果写入原子追加一条变更（task_key、防栅序号、
+    提交时刻与当次 JSON 结果）；相同内容重放与各类失败不追加。
+
+    变更流全局保留最新 `LEASE_RESULT_CHANGE_RETENTION` 条，超出按最旧变更
+    裁剪。传入早于当前最早保留条目的游标返回 **410**（避免在已被裁剪的
+    缺口之后静默续读）；此时应不带游标重新从最早保留记录读起。
+    """
+    if cursor is not None and not _STREAM_ID_PATTERN.match(cursor):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cursor must be a Redis Stream entry id (<ms>-<seq>)",
+        )
+
+    stream = result_change_stream_key(settings)
+    if cursor is not None:
+        # 游标早于当前保留窗口的最早条目：继续读会静默漏掉被裁剪的变更
+        first = await redis.xrange(stream, min="-", max="+", count=1)
+        if first and _stream_id_tuple(cursor) < _stream_id_tuple(first[0][0]):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=(
+                    "cursor is older than the oldest retained change; "
+                    "restart without cursor to read from the oldest "
+                    "retained entry"
+                ),
+            )
+
+    # cursor 语义为"上次最后一条"，用 '(' 排除其本身，避免重复 / 漏读
+    min_id = f"({cursor}" if cursor is not None else "-"
+    raw = await redis.xrange(stream, min=min_id, max="+", count=limit)
+
+    changes = [
+        ResultChange(
+            id=entry_id,
+            task_key=fields.get("task_key", ""),
+            fencing_token=int(fields["fencing"]),
+            committed_at_ms=int(fields["committed_at_ms"]),
+            result=json.loads(fields["result"]),
+        )
+        for entry_id, fields in raw
+    ]
+    # 本页恰好满 limit 时补一次探测，判断后面是否还有变更可翻
+    if len(changes) < limit:
+        next_cursor = None
+    else:
+        probe = await redis.xrange(
+            stream, min=f"({changes[-1].id}", max="+", count=1
+        )
+        next_cursor = changes[-1].id if probe else None
+
+    return ResultChangePage(changes=changes, next_cursor=next_cursor)
 
 
 @app.get(

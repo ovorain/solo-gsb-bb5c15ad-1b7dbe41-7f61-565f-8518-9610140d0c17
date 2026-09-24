@@ -33,7 +33,12 @@ snapshot 单脚本读定义与各前置结果版本（pending 不出快照 / 无
 commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 前置版本漂移或定义变更 / 乱序 -> 409 stale_dependencies 且不改结果、
 重新拉快照后成功、空快照（含缺省字段）等价普通提交、
-快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计。
+快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计；
+以及任务结果变更订阅：
+首次写入（普通 / 受保护提交、新租约覆盖）追加全局变更、
+重放与各类失败不追加、字段（task_key/fencing/committed_at_ms/result）正确、
+游标分页不重不漏、未传游标从最早保留记录读、
+游标早于最早保留条目返回 410、路由优先于 {task_key} 捕获。
 """
 import json
 import sys
@@ -180,6 +185,7 @@ def main():
     limit_checks()
     dependency_checks()
     checked_commit_checks()
+    result_change_checks()
 
     print()
     if FAILED:
@@ -1703,6 +1709,174 @@ def checked_commit_checks():
           len(stale_events) >= 4
           and {e["fencing_token"] for e in stale_events} == {tfence, at2["fencing_token"]},
           f"{[(e['result'], e['fencing_token']) for e in stale_events]}")
+
+
+def fetch_changes(cursor=None, limit=None):
+    """翻一页全局结果变更，返回 (http_code, page_body)。"""
+    qs = []
+    if cursor is not None:
+        qs.append(f"cursor={cursor}")
+    if limit is not None:
+        qs.append(f"limit={limit}")
+    suffix = ("?" + "&".join(qs)) if qs else ""
+    return call("GET", f"/v1/results/changes{suffix}")
+
+
+def result_change_checks():
+    """/v1/results/changes：首次写入才追加 / 字段正确 / 分页 / 410 / 路由顺序。"""
+    base = f"smoke-changes:{int(time.time() * 1000)}"
+    k1, k2, ghost = f"{base}:a", f"{base}:b", f"{base}:ghost"
+
+    # 路由注册顺序：/v1/results/changes 不被 /v1/results/{task_key} 捕获
+    code, page = fetch_changes(limit=1)
+    check("changes route not captured by task_key",
+          code == 200 and "changes" in page and "next_cursor" in page,
+          f"{code} {page}")
+
+    # 未传游标：从当前保留的最早记录读起（与第一页首条一致）
+    code, p_one = fetch_changes(limit=1)
+    code, p_many = fetch_changes(limit=200)
+    check("changes default cursor starts at oldest retained",
+          code == 200 and p_many["changes"]
+          and p_one["changes"][0]["id"] == p_many["changes"][0]["id"],
+          f"{p_one} vs {p_many}")
+
+    # 游标早于最早保留条目 -> 410（真实条目 ID 的毫秒部分恒大于 0）
+    code, gone = fetch_changes(cursor="0-1")
+    check("changes stale cursor -> 410", code == 410, f"{code} {gone}")
+
+    # 参数校验：非法游标 400 / limit 越界 422
+    code, _ = fetch_changes(cursor="not-a-cursor")
+    check("changes bad cursor -> 400", code == 400, f"code={code}")
+    code, _ = fetch_changes(limit=0)
+    check("changes limit 0 -> 422", code == 422, f"code={code}")
+    code, _ = fetch_changes(limit=201)
+    check("changes limit > 200 -> 422", code == 422, f"code={code}")
+
+    # 记录当前流尾：本测试最后执行，之后的变更都应来自下面的操作
+    tail = None
+    cursor = None
+    while True:
+        code, page = fetch_changes(cursor=cursor, limit=200)
+        check("changes tail scan ok", code == 200, f"{code} {page}")
+        if page["changes"]:
+            tail = page["changes"][-1]["id"]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    check("changes stream non-empty (earlier checks committed)",
+          tail is not None, "no changes recorded by earlier checks")
+
+    # 1) 普通提交首次写入 -> 追加一条
+    code, a1 = call("POST", "/v1/leases/acquire",
+                    {"task_key": k1, "ttl_ms": 60_000})
+    check("changes setup acquire k1", code == 200 and a1["acquired"],
+          f"{code} {a1}")
+    payload1 = {"status": "done", "rows": 1}
+    code, c1 = call("POST", "/v1/results/commit",
+                    {"task_key": k1, "token": a1["token"],
+                     "fencing_token": a1["fencing_token"], "result": payload1})
+    check("changes commit k1 first write",
+          code == 200 and c1["committed"] and not c1["replayed"], f"{code} {c1}")
+
+    # 2) 相同内容重放 -> 不追加
+    call("POST", "/v1/results/commit",
+         {"task_key": k1, "token": a1["token"],
+          "fencing_token": a1["fencing_token"], "result": payload1})
+    # 3) 同防栅序号不同内容 -> 409，不追加
+    call("POST", "/v1/results/commit",
+         {"task_key": k1, "token": a1["token"],
+          "fencing_token": a1["fencing_token"], "result": {"rows": 99}})
+    # 4) 错误凭据 -> 409，不追加
+    call("POST", "/v1/results/commit",
+         {"task_key": k1, "token": "wrong",
+          "fencing_token": a1["fencing_token"], "result": payload1})
+    # 5) 无租约 -> 409，不追加
+    call("POST", "/v1/results/commit",
+         {"task_key": ghost, "token": "x", "fencing_token": 1, "result": {}})
+
+    # 6) 受保护提交首次写入（空快照）-> 追加一条
+    code, a2 = call("POST", "/v1/leases/acquire",
+                    {"task_key": k2, "ttl_ms": 60_000})
+    check("changes setup acquire k2", code == 200 and a2["acquired"],
+          f"{code} {a2}")
+    payload2 = {"ok": True}
+    code, c2 = checked_commit(k2, a2["token"], a2["fencing_token"], payload2, [])
+    check("changes checked commit k2 first write",
+          code == 200 and c2["committed"] and not c2["replayed"], f"{code} {c2}")
+    # 7) 受保护提交重放 -> 不追加
+    checked_commit(k2, a2["token"], a2["fencing_token"], payload2, [])
+    # 8) 前置快照过期 -> 409 stale_dependencies，不追加
+    set_dependencies(k2, [k1])
+    code, stale = checked_commit(k2, a2["token"], a2["fencing_token"],
+                                 {"ok": False},
+                                 [{"task_key": k1, "fencing_token": 999}])
+    check("changes stale commit rejected",
+          code == 409 and stale["reason"] == "stale_dependencies",
+          f"{code} {stale}")
+    set_dependencies(k2, [])
+
+    # 9) 新租约接管后提交新结果（覆盖）-> 追加一条
+    call("POST", "/v1/leases/release",
+         {"task_key": k1, "token": a1["token"],
+          "fencing_token": a1["fencing_token"]})
+    code, a1b = call("POST", "/v1/leases/acquire",
+                     {"task_key": k1, "ttl_ms": 60_000})
+    check("changes takeover acquire k1",
+          code == 200 and a1b["fencing_token"] == a1["fencing_token"] + 1,
+          f"{code} {a1b}")
+    payload1b = {"status": "done", "rows": 2}
+    code, c1b = call("POST", "/v1/results/commit",
+                     {"task_key": k1, "token": a1b["token"],
+                      "fencing_token": a1b["fencing_token"], "result": payload1b})
+    check("changes takeover commit first write",
+          code == 200 and c1b["committed"] and not c1b["replayed"],
+          f"{code} {c1b}")
+
+    # 流尾之后恰好 3 条新变更：k1 首次、k2 受保护首次、k1 覆盖；
+    # 重放 / 内容冲突 / 凭据失败 / 前置过期均未追加
+    code, page = fetch_changes(cursor=tail, limit=200)
+    newc = page["changes"]
+    check("changes appended only on first writes",
+          code == 200
+          and [(c["task_key"], c["fencing_token"]) for c in newc]
+          == [(k1, a1["fencing_token"]),
+              (k2, a2["fencing_token"]),
+              (k1, a1b["fencing_token"])],
+          f"{code} {newc}")
+    check("changes no more after tail",
+          page["next_cursor"] is None, f"{page}")
+    if len(newc) == 3:
+        check("changes entry fields",
+              newc[0]["result"] == payload1
+              and newc[0]["committed_at_ms"] == c1["committed_at_ms"]
+              and newc[1]["result"] == payload2
+              and newc[1]["committed_at_ms"] == c2["committed_at_ms"]
+              and newc[2]["result"] == payload1b
+              and newc[2]["committed_at_ms"] == c1b["committed_at_ms"],
+              f"{newc}")
+        ids = [tuple(int(p) for p in c["id"].split("-")) for c in newc]
+        check("changes ids strictly ascending",
+              all(ids[i] < ids[i + 1] for i in range(len(ids) - 1)),
+              f"{[c['id'] for c in newc]}")
+
+    # 分页：limit=1 逐条翻页，与一次性读取完全一致（不重不漏）
+    seen, cursor, pages = [], tail, 0
+    while True:
+        code, page = fetch_changes(cursor=cursor, limit=1)
+        seen.extend(page["changes"])
+        pages += 1
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+        check("changes page size <= limit", len(page["changes"]) <= 1,
+              f"{page}")
+        if pages > 100:
+            check("changes pagination terminates", False, "too many pages")
+            break
+    check("changes pagination by limit=1 complete",
+          [c["id"] for c in seen] == [c["id"] for c in newc],
+          f"{[c['id'] for c in seen]}")
 
 
 if __name__ == "__main__":

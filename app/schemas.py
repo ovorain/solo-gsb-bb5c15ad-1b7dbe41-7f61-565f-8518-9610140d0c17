@@ -365,6 +365,35 @@ class TaskResultResponse(BaseModel):
     )
 
 
+class ResultChange(BaseModel):
+    """单条任务结果变更（全局变更流条目，仅首次写入新结果版本时产生）。"""
+
+    id: str = Field(
+        description="Redis Stream 条目 ID（<毫秒时间>-<序号>），即分页游标"
+    )
+    task_key: str = Field(description="提交该结果的任务键")
+    fencing_token: int = Field(
+        description="提交该结果的租约防栅序号（即结果版本）"
+    )
+    committed_at_ms: int = Field(
+        description="该结果的首次提交时刻（Redis 服务器时钟，Unix 毫秒）"
+    )
+    result: Any = Field(description="当次提交的 JSON 结果（原样返回）")
+
+
+class ResultChangePage(BaseModel):
+    """任务结果变更分页结果（按变更 ID 升序，即旧 -> 新，全局写入顺序）。"""
+
+    changes: list[ResultChange]
+    next_cursor: str | None = Field(
+        default=None,
+        description=(
+            "下一页游标（本页最后一条变更 ID）；本页条数不足 limit 或没有更多"
+            "变更时为 null。原样作为下次请求的 cursor 参数即可继续翻页。"
+        ),
+    )
+
+
 class LimitCheckRequest(BaseModel):
     client_key: str = Field(
         min_length=1,
